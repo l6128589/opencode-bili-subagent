@@ -1,0 +1,18 @@
+# ===== 机器相关的运行产物，绝不入库 =====
+.venv/
+venv/
+
+# ===== B 站凭证与个人状态：你的账号、你的数据，只留在本机 =====
+vendor/bilibili-mcp/bili_credential.json
+bili_state.json
+bili_config.json
+qrcode_login.png
+
+# ===== 自动巡视的内部报告 =====
+out/
+
+# ===== 日志与缓存 =====
+*.log
+panel*.log
+__pycache__/
+*.pyc

@@ -1,0 +1,10 @@
+{
+  "autoMode": "valley",
+  "perDay": 5,
+  "perScan": 3,
+  "gapMin": 180,
+  "defaultDirection": "科技",
+  "minViews": 0,
+  "minAgeDays": 0,
+  "dmMode": "off"
+}
