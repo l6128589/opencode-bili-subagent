@@ -156,11 +156,6 @@ B 站对低等级账号有一批能力闸。撞上这类错误码时，`bili_rep
 - 不确定的事不编——没字幕的视频直接跳过，不硬编内容
 - 私信默认不发（`dmMode=off`）；发也要符合投递提示词的尺度
 
-## 给开发者的提醒
-
-改 `mcp_server.py` 后**必须 bump `index.ts` 里的 `BILI_MCP_BUILD`**——OpenCode 不会因为
-Python 文件变了就重启 MCP 子进程，环境变量差异才会触发 reconcile。忘了 bump 就会一直跑旧代码。
-
 ## 致谢
 
 - [**adoresever/bilibili-mcp**](https://github.com/adoresever/bilibili-mcp)（MIT，Copyright (c) 2026 AGI_Ananas）——
