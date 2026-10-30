@@ -8,6 +8,9 @@ bili_state.json
 bili_config.json
 speakup_config.json
 speakup_log.json
+memory_cfg.json
+memory_log.json
+memory/
 qrcode_login.png
 
 # ===== 自动巡视的内部报告 =====

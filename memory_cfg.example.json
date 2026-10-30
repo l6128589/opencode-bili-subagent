@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "autoRecall": true,
+  "halfLifeDays": 30,
+  "dailyMax": 8,
+  "injectMax": 6,
+  "injectMaxChars": 800,
+  "eviMin": 0.34,
+  "wFresh": 0.25,
+  "wImportance": 0.25,
+  "wMood": 0.25,
+  "wEvidence": 0.25,
+  "lookbackTurns": 2
+}

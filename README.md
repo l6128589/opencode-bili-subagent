@@ -35,12 +35,13 @@
 
 ## 为什么是"薄壳"
 
-TS 侧（`index.ts`）只做四件事，其余全在 Python：
+TS 侧（`index.ts`）只做五件事，其余全在 Python：
 
 1. `ctx.mcp.transform` —— 注册 Python MCP 服务器，**20 个白名单工具**自动暴露成 OpenCode 原生工具
 2. `/bili [方向]` 命令 —— 手动触发一轮
 3. `setInterval` —— 每 60 秒看一次表，谷时到了自动巡视
 4. `/speak` 命令 + 掷骰调度 —— **主动搭话**（见下节），同一 ticker 顺路跑，零额外进程
+5. `ctx.tool.transform` + `ctx.session.hook("context")` —— **memory 记忆**（见下下节）原生工具 + 每轮自动召回注入
 
 B 站所有能力（搜索/字幕/评论/私信/三连）在 `vendor/bilibili-mcp/mcp_server.py`，一个 Python MCP 进程托着。
 
@@ -55,6 +56,7 @@ B 站所有能力（搜索/字幕/评论/私信/三连）在 `vendor/bilibili-mc
 | 评论保护 | 错误原样返回 | **权限记账**：12074/12051/12061/12009 记进状态，附退避提示 |
 | 三连 | — | `bili_triple` 点赞/收藏/投币（币默认不动） |
 | 主动搭话 | [dsh-speak-up](https://github.com/Yuuyuko-uu/dsh-speak-up) 作为独立插件 | **内嵌为本插件子功能**（同一 ticker / 同一峰谷口径 / 同一面板） |
+| 长期记忆 | [dsh-fish-memory](https://github.com/Yuuyuko-uu/dsh-fish-memory) 独立插件（带 jieba 词表 ~900KB、模型提炼） | **内嵌（memory 记忆）**：零依赖 2-gram 分词、轻量导入 |
 
 ## 装
 
@@ -198,6 +200,51 @@ B 站对低等级账号有一批能力闸。撞上这类错误码时，`bili_rep
 配置文件也可以直接改：把仓库里的 `speakup_config.example.json` 抄一份为 `speakup_config.json` 即可，
 缺了哪个键就用内置默认（`dryRun` 只有关成 `false` 才关，其它缺省值一律当开）。
 
+## memory 记忆（会淡忘的长期记忆）
+
+> 移植自 [Yuuyuko-uu/dsh-fish-memory](https://github.com/Yuuyuko-uu/dsh-fish-memory) 的设计：该记的记下来，想起来的时候自己会想起来，不重要的事慢慢淡掉——**不删，只是越来越难被想起**。
+
+```
+写：伙伴觉得值得记 → 调 remember 工具（一句话/重要度/情绪/事实键/检索词）
+       └─ 双闸把关：每天每会话最多 8 条 + 近似去重（防把上下文塞满）
+淡：每条有「鲜活度」，半衰期默认 30 天——只影响排序，不删内容
+读：每轮对话前 hook 自动按话头召回：
+       证据（词越独特越加分）× 鲜活度/重要度/情绪 加权 → 最多 6 条 / 800 字注入本轮 system
+稳：画像/喜好/约定这类 kind=fact 的「长期事实」固定带出，不淡、不占事件名额
+```
+
+**事实键**是可选进阶：`keys: ["她.作息"]` 这种「对象.方面」键，同一键以后再记会自动顶掉旧条
+（旧的标 superseded 保留不删）——「拼团还没开」和「拼团开了」是同一件事的前后，只有最新那条会被想起。
+键里**不许写具体值**（写 `她.作息` 不写 `她.作息凌晨睡`），拿不准就留空，留空没有损失。
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `enabled` | `true` | 总开关 |
+| `autoRecall` | `true` | 每轮自动召回注入（关了就只剩手动 recall 工具） |
+| `halfLifeDays` | `30` | 多久淡一半（天） |
+| `dailyMax` | `8` | 每会话每天最多记几条 |
+| `injectMax` / `injectMaxChars` | `6` / `800` | 每轮最多想起几条 / 注入字数封顶 |
+| `eviMin` | `0.34` | 证据门槛：命中的词不够特别就不想起（调高更少说话、调低更容易想起） |
+| `wFresh` / `wImportance` / `wMood` / `wEvidence` | 各 `0.25` | 四项权重（合计 100%，自动归一） |
+| `lookbackTurns` | `2` | 召回时往前取几轮话头当检索源 |
+
+**两个工具（OpenCode 原生工具，任何会话可用）：**
+
+- `remember` —— 记一件事；每天配额满了会被拒（诚实回话，伙伴不会死磕）
+- `recall` —— 主动想起：给一段话头，返回最贴的几条旧事
+
+**自动召回只对「茶话」会话开着**（主动搭话掷中后建的那个）——写代码的会话不掺和，
+不需要你操心白名单。普通会话照样可用 `remember` / `recall` 手动读写。
+
+**旧档案导入**（网页面板）：填一个 md/txt 路径 → 扫描出候选行（8–120 字，往下两层，
+认得 `.md .txt .log .rst .org` 等）→ 勾选 → 导入茶话会话记库。注意这是**轻量直入**：
+不调模型提炼（原版有这一步），检索词用本地 2-gram 自动生成，人称由原文案自定。
+
+数据都在插件家目录：`memory/<会话>.json`（每会话一库）、`memory_cfg.json`（配置）、
+`memory_log.json`（召回/写入流水，供面板展示）。每次写入前自动留一份 `.bak` 备份。
+分词**没有引 jieba 词典**（原版带 ~900KB 词表）：用零依赖的中文 2-gram + 词频独特度近似，
+库越小反而越准；召回质量后期想升级再换词表也不迟。
+
 ## 红线（写死在派发提示词里）
 
 - 不透露你的隐私：账号、路径、聊过的内容，一个字不进评论
@@ -214,6 +261,8 @@ B 站对低等级账号有一批能力闸。撞上这类错误码时，`bili_rep
   "伙伴自主刷站 + 内部报告 + 额度口径 + 谷时调度"的编排设计参考自它们。
 - [**Yuuyuko-uu/dsh-speak-up**](https://github.com/Yuuyuko-uu/dsh-speak-up)（MIT）——
   "主动搭话"一节的本地掷骰 + 连败加成 + 时机因子 + dry-run 设计完全照它的思路移植。
+- [**Yuuyuko-uu/dsh-fish-memory**](https://github.com/Yuuyuko-uu/dsh-fish-memory)（MIT）——
+  "memory 记忆"一节的鲜活度半衰期 / 证据召回 / 事实键 / 每日配额 / 改前备份设计照它的思路移植（分词用零依赖的 2-gram 代替它的 jieba 词典）。
 
 ## 许可证
 

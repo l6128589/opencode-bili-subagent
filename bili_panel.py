@@ -6,7 +6,10 @@ bili-subagent 网页面板（零依赖：只用 venv 里已有的 aiohttp）
 注意：只监听 127.0.0.1，不对局域网开放。
 """
 import asyncio
+import json
+import os
 import re
+import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -113,6 +116,38 @@ ul.smalllog li { font-size: 12px; color: #9aa0b5; padding: 3px 0; border-bottom:
     </form>
     <ul class="smalllog" id="suLog"></ul>
     <div class="hint">掷到线下才开口：命中线 = min(100, 峰<b id="suhPeak">?</b>% / 谷<b id="suhValley">?</b>% × 时机因子 + min(封顶, 连败×加成))。安静时段（含起不含止）与冷却只推时间不记日志。手动开口用 /speak。</div>
+  </div>
+
+  <div class="card">
+    <div class="grid" id="mKv"></div>
+    <form id="mForm" onsubmit="saveMem(); return false" style="margin-top: 12px">
+      <div><label>记忆开关</label><select id="m_enabled">
+        <option value="1">开：记账 + 召回</option><option value="0">关：全部停用</option></select></div>
+      <div><label>自动召回注入</label><select id="m_autoRecall">
+        <option value="1">开：每轮自动想起（仅茶话会话）</option><option value="0">关：只手动 recall</option></select></div>
+      <div><label>半衰期(天)</label><input id="m_halfLifeDays" type="number" min="1" max="3650"></div>
+      <div><label>每天最多记几条</label><input id="m_dailyMax" type="number" min="1" max="100"></div>
+      <div><label>每轮最多想起几条</label><input id="m_injectMax" type="number" min="1" max="20"></div>
+      <div><label>注入字数封顶</label><input id="m_injectMaxChars" type="number" min="100" max="4000"></div>
+      <div><label>证据门槛 eviMin</label><input id="m_eviMin" type="number" min="0" max="0.9" step="0.01"></div>
+      <div><label>检索回看几轮</label><input id="m_lookbackTurns" type="number" min="1" max="10"></div>
+      <div><label>鲜活度权重</label><input id="m_wFresh" type="number" min="0" max="1" step="0.05"></div>
+      <div><label>重要度权重</label><input id="m_wImportance" type="number" min="0" max="1" step="0.05"></div>
+      <div><label>情绪权重</label><input id="m_wMood" type="number" min="0" max="1" step="0.05"></div>
+      <div><label>证据权重</label><input id="m_wEvidence" type="number" min="0" max="1" step="0.05"></div>
+      <div><button type="submit">保存 memory 配置（下一轮生效）</button></div>
+    </form>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 12px">
+      <div><div class="k" style="font-size: 12px; color: #8b90a3">最近记住的（≤12 条，跨会话）</div><ul class="smalllog" id="mList"></ul></div>
+      <div><div class="k" style="font-size: 12px; color: #8b90a3">最近想起 / 写入流水</div><ul class="smalllog" id="mAct"></ul></div>
+    </div>
+    <div class="row" style="margin-top: 12px">
+      <div><label>旧档案路径（md / txt 等，往下找两层）</label><input id="m_path" placeholder="如 D:\notes\她的记忆档案.md"></div>
+      <div style="max-width: 100px"><label>扫描</label><button type="button" onclick="doMemScan()">扫描出候选</button></div>
+      <div style="max-width: 110px"><label>导入</label><button type="button" class="ghost" onclick="doMemImport()">导入选中</button></div>
+    </div>
+    <ul class="smalllog" id="mCands"></ul>
+    <div class="hint">memory 记忆会淡忘（半衰期只改排序、不删数据）。旧档案导入＝拆成一行一条直入茶话会话记库（轻量、不调模型；第一人称改写这类润色交给日常对话里的伙伴）。调权重四项自动归一成 100%。</div>
   </div>
 
   <div class="card reports">
@@ -233,6 +268,128 @@ async function saveSU() {
   } catch (e) { toast("请求失败：" + e); }
 }
 
+let memDirty = false;   // memory 表单同理：编辑中轮询不覆盖
+document.querySelectorAll("#mForm input, #mForm select").forEach((el) => {
+  el.addEventListener("input", () => { memDirty = true; });
+});
+
+function fillMem(c) {
+  $("m_enabled").value = c.enabled ? "1" : "0";
+  $("m_autoRecall").value = c.autoRecall ? "1" : "0";
+  $("m_halfLifeDays").value = c.halfLifeDays; $("m_dailyMax").value = c.dailyMax;
+  $("m_injectMax").value = c.injectMax; $("m_injectMaxChars").value = c.injectMaxChars;
+  $("m_eviMin").value = c.eviMin; $("m_lookbackTurns").value = c.lookbackTurns;
+  $("m_wFresh").value = c.wFresh; $("m_wImportance").value = c.wImportance;
+  $("m_wMood").value = c.wMood; $("m_wEvidence").value = c.wEvidence;
+  memDirty = false;
+}
+
+function showMem(m) {
+  const c = m.cfg || {};
+  const kvv = [
+    ["记忆开关", c.enabled ? '<span class="ok">开</span>' : '<span class="bad">关</span>'],
+    ["自动召回", c.autoRecall ? '<span class="ok">每轮想起（茶话）</span>' : '<span class="warn">只手动 recall</span>'],
+    ["半衰期", (c.halfLifeDays || 30) + " 天淡一半"],
+    ["每日配额", (c.dailyMax || 8) + " 条/会话"],
+    ["记忆条数", (m.total || 0) + " 条 / " + (m.files || 0) + " 个会话"],
+    ["证据门槛", "evi≥" + (c.eviMin !== undefined ? c.eviMin : 0.34)],
+  ];
+  $("mKv").innerHTML = kvv.map(([k, v]) => '<div class="kv"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>').join("");
+}
+
+function renderMemList(list) {
+  const ul = $("mList");
+  ul.innerHTML = "";
+  (list || []).slice(0, 12).forEach((e) => {
+    const li = document.createElement("li");
+    li.textContent = (e.date || String(e.at || "").slice(0, 10)) + "  " + (e.kind === "fact" ? "[长期] " : "") + String(e.text || "").slice(0, 44);
+    ul.appendChild(li);
+  });
+  if (!ul.children.length) {
+    const li = document.createElement("li");
+    li.textContent = "还没有记下任何一条——在会话里让伙伴顺手调 remember";
+    ul.appendChild(li);
+  }
+}
+
+function renderMemAct(recalls, writes) {
+  const ul = $("mAct");
+  ul.innerHTML = "";
+  const items = [];
+  (recalls || []).slice(0, 7).forEach((r) => items.push(r.at + " 想起「" + String(r.query || "").slice(0, 16) + "」→ " + ((r.injected || []).length) + " 条"));
+  (writes || []).slice(0, 4).forEach((w) => items.push(w.at + " 记下：" + String(w.text || "").slice(0, 18) + (w.type === "import" ? "（导入 " + (w.imported || 0) + " 条）" : "")));
+  items.slice(0, 12).forEach((s) => { const li = document.createElement("li"); li.textContent = s; ul.appendChild(li); });
+  if (!ul.children.length) {
+    const li = document.createElement("li");
+    li.textContent = "还没有召回 / 写入流水";
+    ul.appendChild(li);
+  }
+}
+
+async function saveMem() {
+  const body = {
+    enabled: $("m_enabled").value === "1",
+    autoRecall: $("m_autoRecall").value === "1",
+    halfLifeDays: Number($("m_halfLifeDays").value), dailyMax: Number($("m_dailyMax").value),
+    injectMax: Number($("m_injectMax").value), injectMaxChars: Number($("m_injectMaxChars").value),
+    eviMin: Number($("m_eviMin").value), lookbackTurns: Number($("m_lookbackTurns").value),
+    wFresh: Number($("m_wFresh").value), wImportance: Number($("m_wImportance").value),
+    wMood: Number($("m_wMood").value), wEvidence: Number($("m_wEvidence").value),
+  };
+  try {
+    const r = await fetch("/api/memory", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (d.success) { fillMem(d.config); toast("memory 配置已保存（权重已归一），下一轮生效"); }
+    else toast("memory 保存失败");
+  } catch (e) { toast("请求失败：" + e); }
+}
+
+let memCands = [];   // 扫描出的候选行
+function renderCands() {
+  const ul = $("mCands");
+  ul.innerHTML = "";
+  memCands.slice(0, 200).forEach((t) => {
+    const li = document.createElement("li");
+    const box = document.createElement("input");
+    box.type = "checkbox"; box.checked = true;
+    box.style.width = "auto"; box.style.marginRight = "8px";
+    const span = document.createElement("span");
+    span.textContent = t;
+    li.appendChild(box); li.appendChild(span);
+    ul.appendChild(li);
+  });
+}
+
+async function doMemScan() {
+  const path = $("m_path").value.trim();
+  if (!path) { toast("先填旧档案路径"); return; }
+  try {
+    const d = await (await fetch("/api/memory_scan", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ path }) })).json();
+    if (d.success) {
+      memCands = d.candidates || [];
+      renderCands();
+      toast("扫到 " + memCands.length + " 条候选（" + d.files + " 个文件），勾选后导入");
+    } else toast("扫描失败：" + (d.error || "未知"));
+  } catch (e) { toast("请求失败：" + e); }
+}
+
+async function doMemImport() {
+  const texts = [];
+  document.querySelectorAll("#mCands input[type=checkbox]").forEach((b) => {
+    if (b.checked && b.nextElementSibling) texts.push(b.nextElementSibling.textContent);
+  });
+  if (!texts.length) { toast("先扫描并勾选要导入的行"); return; }
+  try {
+    const d = await (await fetch("/api/memory_import", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ texts }) })).json();
+    if (d.success) {
+      toast("已导入 " + d.imported + " 条进茶话记库（跳过重复 " + d.skipped + "）");
+      $("mCands").innerHTML = "";
+      memCands = [];
+      loadState();
+    } else toast("导入失败：" + (d.error || "未知"));
+  } catch (e) { toast("请求失败：" + e); }
+}
+
 async function saveCfg() {
   const body = {
     autoMode: $("f_autoMode").value, dmMode: $("f_dmMode").value,
@@ -285,6 +442,11 @@ async function loadState() {
     showSU(su);
     if (!suDirty) fillSU(su.cfg || {});
     renderSuLog(su.log);
+    const mem = s.memory || {};
+    showMem(mem);
+    if (!memDirty) fillMem(mem.cfg || {});
+    renderMemList(mem.latest);
+    renderMemAct(mem.recalls, mem.writes);
     // 只有表单没在被编辑时才同步进输入框；dirty 时不打扰正在改配置的人
     if (!formDirty) fillCfg(s.config);
     const ul = $("repList");
@@ -377,6 +539,115 @@ def read_su_cfg():
     return cfg
 
 
+# ---------- memory 记忆：memory_cfg.json 配置 + memory/ 每会话一库 + memory_log.json 召回流水 ----------
+MEM_CFG_FILE = PLUGIN_HOME / "memory_cfg.json"
+MEM_DIR = PLUGIN_HOME / "memory"
+MEM_LOG_FILE = PLUGIN_HOME / "memory_log.json"
+
+_MEM_DEFAULTS = {
+    "enabled": True,
+    "autoRecall": True,      # hook 每轮自动召回注入
+    "halfLifeDays": 30,      # 多久淡一半（天）
+    "dailyMax": 8,           # 每会话每天最多记几条
+    "injectMax": 6,          # 每轮最多注入几条
+    "injectMaxChars": 800,   # 每轮注入字数封顶
+    "eviMin": 0.34,          # 证据门槛
+    "wFresh": 0.25,
+    "wImportance": 0.25,
+    "wMood": 0.25,
+    "wEvidence": 0.25,
+    "lookbackTurns": 2,
+}
+_MEM_NUM_INT = {
+    "halfLifeDays": (1, 3650), "dailyMax": (1, 100), "injectMax": (1, 20),
+    "injectMaxChars": (100, 4000), "lookbackTurns": (1, 10),
+}
+
+_MEM_TOK_RE = re.compile(r"[\u4e00-\u9fff]+|[a-zA-Z0-9_]{2,}")
+_MEM_WORD_RE = re.compile(r"[a-zA-Z0-9_]+")
+# 与 index.ts tokensOf 同口径：CJK 段 2-gram + 整段奖励，拉丁词按词
+def mem_tokens(text):
+    out = set()
+    for seg in _MEM_TOK_RE.findall(text or ""):
+        if _MEM_WORD_RE.fullmatch(seg):
+            out.add(seg.lower())
+        elif len(seg) <= 2:
+            out.add(seg)
+        else:
+            for i in range(len(seg) - 1):
+                out.add(seg[i:i + 2])
+            out.add(seg)
+    return sorted(out)
+
+
+def _mem_norm_weights(cfg):
+    """权重四项归一（与 TS normWeights 同口径：负数当 0，全 0 回默认，按比例归一）。"""
+    vals = []
+    for k in ("wFresh", "wImportance", "wMood", "wEvidence"):
+        try:
+            vals.append(max(0.0, float(cfg.get(k))))
+        except (TypeError, ValueError):
+            vals.append(0.25)
+    total = sum(vals)
+    if total <= 0:
+        vals = [0.25, 0.25, 0.25, 0.25]
+        total = 1.0
+    for k, v in zip(("wFresh", "wImportance", "wMood", "wEvidence"), vals):
+        cfg[k] = round(v / total, 2)
+
+
+def read_mem_cfg():
+    cfg = dict(_MEM_DEFAULTS)
+    cfg.update({k: v for k, v in ms._load_json_file(MEM_CFG_FILE, {}).items() if k in _MEM_DEFAULTS})
+    for k, (lo, hi) in _MEM_NUM_INT.items():
+        try:
+            cfg[k] = int(cfg[k])
+        except (TypeError, ValueError):
+            cfg[k] = _MEM_DEFAULTS[k]
+        cfg[k] = max(lo, min(hi, cfg[k]))
+    try:
+        cfg["eviMin"] = max(0.0, min(0.9, float(cfg["eviMin"])))
+    except (TypeError, ValueError):
+        cfg["eviMin"] = _MEM_DEFAULTS["eviMin"]
+    _mem_norm_weights(cfg)
+    cfg["enabled"] = cfg["enabled"] is not False     # 只有显式 false 才关，等级同 TS 端
+    cfg["autoRecall"] = cfg["autoRecall"] is not False
+    return cfg
+
+
+def _mem_load_file(session_id):
+    """读某会话的记库（与 index.ts loadMemFile 同结构：{entries:[最新在前], days:{}}）。"""
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
+    path = MEM_DIR / (safe + ".json")
+    raw = ms._load_json_file(path, {})
+    if isinstance(raw, dict):
+        entries = raw.get("entries")
+        if not isinstance(entries, list):
+            entries = []
+        days = raw.get("days")
+        if not isinstance(days, dict):
+            days = {}
+        return entries, days
+    return [], {}
+
+
+def _mem_save_file(session_id, entries, days):
+    """写某会话的记库：改前备份 .bak + 原子替换（照 TS 端 saveMemFile 的语义）。"""
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
+    MEM_DIR.mkdir(parents=True, exist_ok=True)
+    path = MEM_DIR / (safe + ".json")
+    if path.exists():
+        shutil.copyfile(str(path), str(path) + ".bak")
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"entries": entries[:500], "days": days}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, str(path))
+
+
+def _mem_cache_bj_time():
+    return datetime.now(_BJ).strftime("%Y-%m-%d %H:%M:%S")
+
+
 async def api_state(_):
     cfg = _read_cfg()
     st = ms._load_json_file(ms.STATE_FILE, {"seen": [], "days": {}, "lastScanAt": ""})
@@ -387,6 +658,19 @@ async def api_state(_):
             reports.append({"date": p.stem, "size": p.stat().st_size})
     su = ms._load_json_file(SU_LOG_FILE, {})   # {state: {...}, log: [...]}
     su_state = su.get("state", {}) if isinstance(su.get("state", {}), dict) else {}
+    # memory 记忆：全库汇总（跳过 .bak/.tmp），最新在前
+    mem_latest, mem_total, mem_files_n = [], 0, 0
+    if MEM_DIR.exists():
+        for p in sorted(MEM_DIR.glob("*.json")):
+            if p.name.endswith(".tmp") or p.name.endswith(".bak"):
+                continue
+            mem_files_n += 1
+            data = ms._load_json_file(p, {})
+            entries = data.get("entries") if isinstance(data.get("entries"), list) else []
+            mem_total += len(entries)
+            mem_latest.extend(e for e in entries if isinstance(e, dict) and not e.get("supersededBy"))
+    mem_latest.sort(key=lambda e: int(e.get("ts") or 0), reverse=True)
+    mem_log = ms._load_json_file(MEM_LOG_FILE, {})
     return web.json_response({
         "loggedIn": bool(ms.load_credential()),
         "today": today,
@@ -407,6 +691,14 @@ async def api_state(_):
             },
             "log": list(su.get("log") or [])[:12],
             "cfg": read_su_cfg(),
+        },
+        "memory": {
+            "cfg": read_mem_cfg(),
+            "total": mem_total,
+            "files": mem_files_n,
+            "latest": mem_latest[:12],
+            "recalls": list(mem_log.get("recalls") or [])[:6],
+            "writes": list(mem_log.get("writes") or [])[:6],
         },
     })
 
@@ -489,6 +781,130 @@ async def api_speakup(request):
     return web.json_response({"success": True, "config": cfg})
 
 
+async def api_memory(request):
+    """保存 memory 记忆配置：白名单 + clamp + 权重归一，与 index.ts readMemCfg 同口径。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    cfg = read_mem_cfg()
+    cfg["enabled"] = body.get("enabled") is True
+    cfg["autoRecall"] = body.get("autoRecall") is not False
+    for k, (lo, hi) in _MEM_NUM_INT.items():
+        if k in body and isinstance(body[k], (int, float)):
+            cfg[k] = int(body[k])
+        cfg[k] = max(lo, min(hi, cfg[k]))
+    if "eviMin" in body and isinstance(body["eviMin"], (int, float)):
+        cfg["eviMin"] = max(0.0, min(0.9, float(body["eviMin"])))
+    for k in ("wFresh", "wImportance", "wMood", "wEvidence"):
+        if k in body and isinstance(body[k], (int, float)):
+            cfg[k] = float(body[k])
+    _mem_norm_weights(cfg)
+    ms._save_json_atomic(MEM_CFG_FILE, cfg)
+    print(f"[panel] memory 记忆已保存：enabled={cfg['enabled']} halfLife={cfg['halfLifeDays']}d eviMin={cfg['eviMin']}", file=sys.stderr)
+    return web.json_response({"success": True, "config": cfg})
+
+
+_SCAN_TXT = {".md", ".markdown", ".txt", ".text", ".log", ".rst", ".org"}
+
+async def api_memory_scan(request):
+    """扫旧档案出候选行（往下两层，md/txt 系；与原版认得的格式一致）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    path = str((body or {}).get("path") or "").strip().strip('"')
+    if not path:
+        return web.json_response({"success": False, "error": "缺 path"}, status=422)
+    base = Path(os.path.expanduser(path))
+    if not base.exists():
+        return web.json_response({"success": False, "error": "路径不存在"}, status=404)
+    files = []
+    if base.is_file():
+        files = [base]
+    else:
+        for child in base.iterdir():
+            if child.is_file() and child.suffix.lower() in _SCAN_TXT:
+                files.append(child)
+            elif child.is_dir():
+                for g in child.iterdir():
+                    if g.is_file() and g.suffix.lower() in _SCAN_TXT:
+                        files.append(g)
+    files = files[:40]
+    seen, candidates = set(), []
+    for f in files:
+        try:
+            if f.stat().st_size > 5 * 1024 * 1024:
+                continue
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            s = re.sub(r"^[#>\-\*\s•·]+", "", line.strip()).strip()
+            if not (8 <= len(s) <= 120) or s in seen:
+                continue
+            if s.startswith(("http", "|")) or "```" in s or "https:" in s or "http:" in s:
+                continue
+            seen.add(s)
+            candidates.append(s)
+            if len(candidates) >= 200:
+                break
+        if len(candidates) >= 200:
+            break
+    return web.json_response({"success": True, "files": len(files), "count": len(candidates), "candidates": candidates})
+
+
+async def api_memory_import(request):
+    """把勾选的候选行直入茶话会话的记库（轻量直入：kind=event、重要度 2、检索词本地 2-gram；不占每日配额）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    texts = [t.strip() for t in (body.get("texts") or []) if isinstance(t, str) and t.strip()][:100]
+    if not texts:
+        return web.json_response({"success": False, "error": "没勾选任何条目"}, status=422)
+    # 导入目标：茶话会话（主动搭话掷中后自动建的那个），面板无法预知 ID，从 speakup 状态里拿
+    su_state = (ms._load_json_file(SU_LOG_FILE, {}).get("state") or {})
+    fid = str(su_state.get("sessionID") or "").strip()
+    if not fid:
+        return web.json_response({"success": False, "error": "茶话会话还没建立（让主动搭话掷中一次就自动创建）"}, status=409)
+    entries, days = _mem_load_file(fid)
+    imported, skipped = 0, 0
+    now_ms = int(_bj_now().timestamp() * 1000)
+    fresh = []
+    existing_head = {str(e.get("text", ""))[:24] for e in entries[:60]}
+    for t in texts:
+        if t[:24] in existing_head:
+            skipped += 1
+            continue
+        now_ms += 1
+        fresh.append({
+            "id": "p" + format(now_ms, "x") + format(imported, "x"),
+            "ts": now_ms,
+            "at": _mem_cache_bj_time(),
+            "text": t,
+            "kind": "event",
+            "importance": 2,
+            "mood": 0,
+            "keys": [],
+            "words": mem_tokens(t),
+        })
+        existing_head.add(t[:24])
+        imported += 1
+    if imported:
+        _mem_save_file(fid, fresh + entries, days)
+        # 写入流水（父端只读展示）
+        log = ms._load_json_file(MEM_LOG_FILE, {})
+        writes = log.get("writes") if isinstance(log.get("writes"), list) else []
+        writes.insert(0, {"at": _mem_cache_bj_time(), "type": "import", "sessionID": fid, "imported": imported, "skipped": skipped})
+        ms._save_json_atomic(MEM_LOG_FILE, {"recalls": log.get("recalls") or [], "writes": writes[:12]})
+    return web.json_response({"success": True, "imported": imported, "skipped": skipped, "sessionID": fid})
+
+
 async def index(_):
     return web.Response(text=_HTML, content_type="text/html")
 
@@ -501,6 +917,9 @@ def main():
     app.router.add_post("/api/config", api_config)
     app.router.add_post("/api/scan", api_scan)
     app.router.add_post("/api/speakup", api_speakup)
+    app.router.add_post("/api/memory", api_memory)
+    app.router.add_post("/api/memory_scan", api_memory_scan)
+    app.router.add_post("/api/memory_import", api_memory_import)
     print(f"[panel] http://127.0.0.1:{PORT}", file=sys.stderr)
     web.run_app(app, host="127.0.0.1", port=PORT, print=None)
 
