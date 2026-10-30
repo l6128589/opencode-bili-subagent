@@ -54,6 +54,8 @@ button:disabled { opacity: .5; cursor: default; }
 .reports li.on { background: #fb729922; color: #fb7299; }
 pre { white-space: pre-wrap; word-break: break-word; flex: 1; min-width: 320px; margin: 0; font-size: 13px; line-height: 1.55; background: #14161f; border-radius: 8px; padding: 12px; max-height: 60vh; overflow: auto; }
 .hint { font-size: 12px; color: #8b90a3; margin-top: 6px; }
+ul.smalllog { list-style: none; margin: 10px 0 0; padding: 0; max-height: 210px; overflow: auto; }
+ul.smalllog li { font-size: 12px; color: #9aa0b5; padding: 3px 0; border-bottom: 1px solid #20242f; }
 </style>
 </head>
 <body>
@@ -88,6 +90,31 @@ pre { white-space: pre-wrap; word-break: break-word; flex: 1; min-width: 320px; 
     <div class="hint">谷时＝工作日 9–12、14–18 之外（含整个周末），DeepSeek 定价口径，按北京时间。</div>
   </div>
 
+  <div class="card">
+    <div class="grid" id="suKv"></div>
+    <form id="suForm" onsubmit="saveSU(); return false" style="margin-top: 12px">
+      <div><label>功能开关</label><select id="s_enabled">
+        <option value="1">开：按间隔自动掷骰</option><option value="0">关：彻底不掷</option></select></div>
+      <div><label>演练模式 dry-run</label><select id="s_dryRun">
+        <option value="1">开：掷中只记账不真发</option><option value="0">关：掷中就真派</option></select></div>
+      <div><label>掷骰间隔(分)</label><input id="s_intervalMin" type="number" min="1" max="1440"></div>
+      <div><label>开口后冷却(分)</label><input id="s_cooldownMin" type="number" min="0" max="1440"></div>
+      <div><label>没中加成 × 次数</label><input id="s_missBoost" type="number" min="0" max="100"></div>
+      <div><label>加成封顶</label><input id="s_missBoostMax" type="number" min="0" max="100"></div>
+      <div><label>安静时段起(时)</label><input id="s_quietStart" type="number" min="0" max="23"></div>
+      <div><label>安静时段止(时)</label><input id="s_quietEnd" type="number" min="0" max="24"></div>
+      <div><label>刚聊过阈值(分)</label><input id="s_nearMin" type="number" min="1" max="1440"></div>
+      <div><label>冷太久阈值(分)</label><input id="s_farMin" type="number" min="1" max="10080"></div>
+      <div><label>峰时命中率 %</label><input id="s_peakHit" type="number" min="0" max="100"></div>
+      <div><label>谷时命中率 %</label><input id="s_valleyHit" type="number" min="0" max="100"></div>
+      <div style="grid-column: 1 / -1"><label>开口动机语（掷中后送进茶话会话的一句话）</label><input id="s_prompt"></div>
+      <div><button type="submit">保存主动搭话（下一 tick 生效）</button></div>
+      <div><button type="button" class="ghost" onclick="toast('掷骰和冷却都不管：在 OpenCode 会话里敲 /speak 演练、/speak 真发 即时开口')">手动开口在日常对话里</button></div>
+    </form>
+    <ul class="smalllog" id="suLog"></ul>
+    <div class="hint">掷到线下才开口：命中线 = min(100, 峰<b id="suhPeak">?</b>% / 谷<b id="suhValley">?</b>% × 时机因子 + min(封顶, 连败×加成))。安静时段（含起不含止）与冷却只推时间不记日志。手动开口用 /speak。</div>
+  </div>
+
   <div class="card reports">
     <ul id="repList"></ul>
     <pre id="repView">← 点左边的日期看当天内部报告</pre>
@@ -102,6 +129,11 @@ let formDirty = false;   // 用户正在编辑表单时，轮询不覆盖（修�
 // 编辑表单一有输入就标记 dirty，轮询 fillCfg 让位
 document.querySelectorAll("#cfgForm input, #cfgForm select").forEach((el) => {
   el.addEventListener("input", () => { formDirty = true; });
+});
+
+let suDirty = false;   // 主动搭话表单同理：编辑中轮询不覆盖
+document.querySelectorAll("#suForm input, #suForm select").forEach((el) => {
+  el.addEventListener("input", () => { suDirty = true; });
 });
 
 function toast(msg) { const t = $("toast"); t.textContent = msg; t.style.opacity = 1; setTimeout(() => t.style.opacity = 0, 2200); }
@@ -134,6 +166,72 @@ function showCurrent(c) {
   $("curCfg").innerHTML = "当前生效：<b>" + esc(MODE_CN[c.autoMode] || c.autoMode) + "</b>"
     + " · 每天 " + c.perDay + " 轮 · 每轮 " + c.perScan + " 条 · 间隔 " + c.gapMin + " 分"
     + " · 方向「" + esc(c.defaultDirection) + "」· 私信 " + (DM_CN[c.dmMode] || c.dmMode); }
+
+const SU_TYPE_CN = { miss: "没掷中", dry: "掷中·演练", speak: "掷中·真发", failed: "真发失败", "manual-dry": "手动演练", "manual-speak": "手动真发", "manual-failed": "手动失败" };
+
+function fmtT(ms) {   // 毫秒 → 北京时间串（零反斜杠写法：不用正则、不用转义）
+  if (!ms) return "—";
+  return new Date(ms + 8 * 3600 * 1000).toISOString().slice(0, 19).replace("T", " ");
+}
+
+function fillSU(c) {   // 服务器返回的落盘结果回填，所见即所存
+  $("s_enabled").value = c.enabled ? "1" : "0";
+  $("s_dryRun").value = c.dryRun ? "1" : "0";
+  $("s_intervalMin").value = c.intervalMin; $("s_cooldownMin").value = c.cooldownMin;
+  $("s_missBoost").value = c.missBoost; $("s_missBoostMax").value = c.missBoostMax;
+  $("s_quietStart").value = c.quietStart; $("s_quietEnd").value = c.quietEnd;
+  $("s_nearMin").value = c.nearMin; $("s_farMin").value = c.farMin;
+  $("s_peakHit").value = c.peakHit; $("s_valleyHit").value = c.valleyHit;
+  $("s_prompt").value = c.prompt;
+  $("suhPeak").textContent = c.peakHit; $("suhValley").textContent = c.valleyHit;
+  suDirty = false;
+}
+
+function showSU(su) {   // 状态卡永远用服务器真相，不掺表单编辑值
+  const st = su.state || {}, c = su.cfg || {};
+  const kvv = [
+    ["搭话开关", c.enabled ? '<span class="ok">开</span>' : '<span class="bad">关</span>'],
+    ["演练模式", c.dryRun ? '<span class="warn">dry-run 只记账</span>' : '<span class="ok">真发</span>'],
+    ["连续没中", (st.misses || 0) + " 次"],
+    ["最近掷骰", fmtT(st.lastRollAt)],
+    ["最近开口", fmtT(st.lastSpeakAt)],
+    ["目标会话", st.sessionID ? String(st.sessionID).slice(0, 8) + "…" : "自动新建（茶话）"],
+  ];
+  $("suKv").innerHTML = kvv.map(([k, v]) => '<div class="kv"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>').join("");
+}
+
+function renderSuLog(log) {   // 最近掷骰记录：DOM 构建，不拼 onclick、不吃转义
+  const ul = $("suLog");
+  ul.innerHTML = "";
+  (log || []).slice(0, 12).forEach((e) => {
+    const li = document.createElement("li");
+    let s = e.at + "  " + (SU_TYPE_CN[e.type] || e.type || "?");
+    if (typeof e.roll === "number") s += "（掷 " + e.roll + " / 线 " + e.line + "）";
+    if (e.peak) s += " [峰时]";
+    if (e.error) s += "：" + e.error;
+    li.textContent = s;
+    ul.appendChild(li);
+  });
+}
+
+async function saveSU() {
+  const body = {
+    enabled: $("s_enabled").value === "1",
+    dryRun: $("s_dryRun").value === "1",
+    intervalMin: Number($("s_intervalMin").value), cooldownMin: Number($("s_cooldownMin").value),
+    missBoost: Number($("s_missBoost").value), missBoostMax: Number($("s_missBoostMax").value),
+    quietStart: Number($("s_quietStart").value), quietEnd: Number($("s_quietEnd").value),
+    nearMin: Number($("s_nearMin").value), farMin: Number($("s_farMin").value),
+    peakHit: Number($("s_peakHit").value), valleyHit: Number($("s_valleyHit").value),
+    prompt: $("s_prompt").value,
+  };
+  try {
+    const r = await fetch("/api/speakup", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (d.success) { fillSU(d.config); toast("主动搭话已保存（intervalMin=" + d.config.intervalMin + "），下一 tick 生效"); }
+    else toast("主动搭话保存失败");
+  } catch (e) { toast("请求失败：" + e); }
+}
 
 async function saveCfg() {
   const body = {
@@ -183,6 +281,10 @@ async function loadState() {
     ];
     $("kv").innerHTML = kv.map(([k, v]) => '<div class="kv"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>').join("");
     showCurrent(s.config);
+    const su = s.speakUp || {};
+    showSU(su);
+    if (!suDirty) fillSU(su.cfg || {});
+    renderSuLog(su.log);
     // 只有表单没在被编辑时才同步进输入框；dirty 时不打扰正在改配置的人
     if (!formDirty) fillCfg(s.config);
     const ul = $("repList");
@@ -228,6 +330,53 @@ def _read_cfg():
     return cfg
 
 
+# ---------- 主动搭话（speakup）：独立配置文件，避开 bili_config 整文件重写丢字段的风险 ----------
+SU_CFG_FILE = PLUGIN_HOME / "speakup_config.json"
+SU_LOG_FILE = PLUGIN_HOME / "speakup_log.json"
+
+_SU_DEFAULTS = {
+    "enabled": True,
+    "dryRun": True,          # 默认演练：掷中了也只记账不真发
+    "intervalMin": 30,       # 每隔多少分钟掷一次骰子
+    "cooldownMin": 20,       # 开口后冷却（分钟）
+    "missBoost": 10,         # 每没中一次，下次命中线加多少
+    "missBoostMax": 40,      # 加成封顶
+    "quietStart": 1,         # 安静时段起点小时（含起，北京时间）
+    "quietEnd": 8,           # 止点（不含止）；相等 = 关闭安静时段
+    "nearMin": 20,           # 距上次对话 < near 分钟 → 命中线 ×0.15
+    "farMin": 360,           # > far 分钟 → ×1.5
+    "peakHit": 20,           # 峰时基础命中率 %
+    "valleyHit": 60,         # 谷时基础命中率 %
+    "prompt": "好久没什么动静了……想找个话说说话",
+    "targetSessionID": "",   # 省 = 插件自动新建并复用「茶话」会话（面板不提供，README 说明手改）
+}
+
+# 数值字段的 clamp 区间（与 index.ts readSpeakUpCfg 的白名单一一对应）
+_SU_NUM = {
+    "intervalMin": (1, 1440), "cooldownMin": (0, 1440), "missBoost": (0, 100),
+    "missBoostMax": (0, 100), "quietStart": (0, 23), "quietEnd": (0, 24),
+    "nearMin": (1, 1440), "farMin": (1, 10080), "peakHit": (0, 100), "valleyHit": (0, 100),
+}
+
+
+def read_su_cfg():
+    cfg = dict(_SU_DEFAULTS)
+    cfg.update({k: v for k, v in ms._load_json_file(SU_CFG_FILE, {}).items() if k in _SU_DEFAULTS})
+    for k, (lo, hi) in _SU_NUM.items():
+        try:
+            cfg[k] = int(cfg[k])
+        except (TypeError, ValueError):
+            cfg[k] = _SU_DEFAULTS[k]
+        cfg[k] = max(lo, min(hi, cfg[k]))
+    cfg["enabled"] = cfg["enabled"] is True
+    cfg["dryRun"] = cfg["dryRun"] is not False   # 只有显式 false 才关，等级同 TS 端
+    if not isinstance(cfg["prompt"], str) or not cfg["prompt"].strip():
+        cfg["prompt"] = _SU_DEFAULTS["prompt"]
+    if not isinstance(cfg["targetSessionID"], str):
+        cfg["targetSessionID"] = ""
+    return cfg
+
+
 async def api_state(_):
     cfg = _read_cfg()
     st = ms._load_json_file(ms.STATE_FILE, {"seen": [], "days": {}, "lastScanAt": ""})
@@ -236,6 +385,8 @@ async def api_state(_):
     if ms.OUT_DIR.exists():
         for p in sorted(ms.OUT_DIR.glob("*.md"), key=lambda x: x.name, reverse=True):
             reports.append({"date": p.stem, "size": p.stat().st_size})
+    su = ms._load_json_file(SU_LOG_FILE, {})   # {state: {...}, log: [...]}
+    su_state = su.get("state", {}) if isinstance(su.get("state", {}), dict) else {}
     return web.json_response({
         "loggedIn": bool(ms.load_credential()),
         "today": today,
@@ -247,6 +398,16 @@ async def api_state(_):
         "reports": reports,
         "config": cfg,
         "account": ms._load_account_state(),
+        "speakUp": {
+            "state": {
+                "lastRollAt": int(su_state.get("lastRollAt") or 0),
+                "lastSpeakAt": int(su_state.get("lastSpeakAt") or 0),
+                "misses": int(su_state.get("misses") or 0),
+                "sessionID": str(su_state.get("sessionID") or ""),
+            },
+            "log": list(su.get("log") or [])[:12],
+            "cfg": read_su_cfg(),
+        },
     })
 
 
@@ -305,6 +466,29 @@ async def api_scan(request):
     return web.json_response({"success": True, "direction": direction, "count": count})
 
 
+async def api_speakup(request):
+    """保存主动搭话配置：全字段白名单 + clamp，与 index.ts 的 readSpeakUpCfg 同口径。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    cfg = read_su_cfg()
+    cfg["enabled"] = body.get("enabled") is True
+    cfg["dryRun"] = body.get("dryRun") is not False
+    for k, (lo, hi) in _SU_NUM.items():
+        if k in body and isinstance(body[k], (int, float)):
+            cfg[k] = int(body[k])
+        cfg[k] = max(lo, min(hi, cfg[k]))
+    if "prompt" in body and str(body.get("prompt") or "").strip():
+        cfg["prompt"] = str(body["prompt"]).strip()
+    # targetSessionID 不经面板改（高级项，直接编辑 speakup_config.json），保持原值
+    ms._save_json_atomic(SU_CFG_FILE, cfg)
+    print(f"[panel] 主动搭话已保存：enabled={cfg['enabled']} dryRun={cfg['dryRun']} intervalMin={cfg['intervalMin']}", file=sys.stderr)
+    return web.json_response({"success": True, "config": cfg})
+
+
 async def index(_):
     return web.Response(text=_HTML, content_type="text/html")
 
@@ -316,6 +500,7 @@ def main():
     app.router.add_get("/api/report/{date}", api_report)
     app.router.add_post("/api/config", api_config)
     app.router.add_post("/api/scan", api_scan)
+    app.router.add_post("/api/speakup", api_speakup)
     print(f"[panel] http://127.0.0.1:{PORT}", file=sys.stderr)
     web.run_app(app, host="127.0.0.1", port=PORT, print=None)
 

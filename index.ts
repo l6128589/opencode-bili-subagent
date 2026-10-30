@@ -6,6 +6,7 @@
 // 卸载时清掉定时器（返回 cleanup）。
 
 import { existsSync } from "node:fs"
+import { readFile, rename, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Plugin } from "@opencode/plugin"
@@ -90,6 +91,117 @@ type SchedState = {
   sessionID: string   // 自建并复用的巡视会话
 }
 
+// ---------- 主动搭话（speak-up，掷骰思路参考 Yuuyuko-uu/dsh-speak-up：本地随机 0 token，掷中才让伙伴开口）----------
+type SpeakUpCfg = {
+  enabled: boolean
+  dryRun: boolean
+  intervalMin: number
+  cooldownMin: number
+  missBoost: number
+  missBoostMax: number
+  quietStart: number
+  quietEnd: number
+  nearMin: number
+  farMin: number
+  peakHit: number
+  valleyHit: number
+  prompt: string
+  targetSessionID: string
+}
+
+const SPEAKUP_DEFAULTS: SpeakUpCfg = {
+  enabled: true,
+  dryRun: true,          // 默认演练：掷中了也只记账不真发，安全试跑
+  intervalMin: 30,       // 每隔多少分钟掷一次骰子
+  cooldownMin: 20,       // 开口后这么多分钟内不再开口（0 = 不冷却）
+  missBoost: 10,         // 每没中一次，下次命中线加这么多百分点
+  missBoostMax: 40,      // 加成封顶
+  quietStart: 1,         // 安静时段起点小时（含起）——本机时区
+  quietEnd: 8,           // 止点（不含止）；相等 = 关闭安静时段
+  nearMin: 20,           // 距最近一次对话 < near 分钟 → 命中线 ×0.15（刚聊过）
+  farMin: 360,           // > far 分钟 → ×1.5（冷太久）；中间 ×1
+  peakHit: 20,           // 峰时命中线 %（贵，少开口）
+  valleyHit: 60,         // 谷时命中线 %（便宜，多开口）
+  prompt: "好久没什么动静了……想找个话说说话",
+  targetSessionID: "",   // 空 = 自动新建并复用「茶话」会话
+}
+
+const SPEAKUP_CFG = join(PLUGIN_DIR, "speakup_config.json")   // 配置（面板写、宿主读）
+const SPEAKUP_LOG = join(PLUGIN_DIR, "speakup_log.json")      // 状态 + 最近 60 条掷骰记录（宿主写、面板读）
+
+// 安静时段：含起不含止，跨午夜也行（23~7）；起 === 止 = 关闭
+function inQuietHours(hour: number, cfg: SpeakUpCfg): boolean {
+  const a = cfg.quietStart
+  const b = cfg.quietEnd
+  if (a === b) return false
+  return a < b ? (hour >= a && hour < b) : (hour >= a || hour < b)
+}
+
+function bjTime(ms = Date.now()): string {
+  return new Date(ms + 8 * 3600_000).toISOString().replace("T", " ").slice(0, 19)
+}
+
+function round1(n: number): number {
+  return Math.round(n * 10) / 10
+}
+
+async function readSpeakUpCfg(): Promise<SpeakUpCfg> {
+  const out = { ...SPEAKUP_DEFAULTS }
+  try {
+    const raw = JSON.parse(await readFile(SPEAKUP_CFG, "utf-8")) as Record<string, unknown>
+    out.enabled = raw.enabled === true
+    out.dryRun = raw.dryRun !== false
+    out.intervalMin = clampNum(raw.intervalMin, 30, 1, 1440)
+    out.cooldownMin = clampNum(raw.cooldownMin, 20, 0, 1440)
+    out.missBoost = clampNum(raw.missBoost, 10, 0, 100)
+    out.missBoostMax = clampNum(raw.missBoostMax, 40, 0, 100)
+    out.quietStart = clampNum(raw.quietStart, 1, 0, 23)
+    out.quietEnd = clampNum(raw.quietEnd, 8, 0, 24)
+    out.nearMin = clampNum(raw.nearMin, 20, 1, 1440)
+    out.farMin = clampNum(raw.farMin, 360, 1, 10080)
+    out.peakHit = clampNum(raw.peakHit, 20, 0, 100)
+    out.valleyHit = clampNum(raw.valleyHit, 60, 0, 100)
+    if (typeof raw.prompt === "string" && raw.prompt.trim()) out.prompt = raw.prompt.trim()
+    if (typeof raw.targetSessionID === "string") out.targetSessionID = raw.targetSessionID.trim()
+  } catch {
+    // 没有配置文件就用默认值（dryRun 默认开，安全）
+  }
+  return out
+}
+
+type SpeakUpState = { lastRollAt: number; lastSpeakAt: number; misses: number; sessionID: string }
+type SpeakFile = { state: SpeakUpState; log: Record<string, unknown>[] }
+
+async function loadSpeakFile(): Promise<SpeakFile> {
+  try {
+    const raw = JSON.parse(await readFile(SPEAKUP_LOG, "utf-8")) as { state?: Partial<SpeakUpState>; log?: unknown[] }
+    return {
+      state: {
+        lastRollAt: clampNum(raw.state?.lastRollAt, 0, 0, Number.MAX_SAFE_INTEGER),
+        lastSpeakAt: clampNum(raw.state?.lastSpeakAt, 0, 0, Number.MAX_SAFE_INTEGER),
+        misses: clampNum(raw.state?.misses, 0, 0, 100000),
+        sessionID: typeof raw.state?.sessionID === "string" ? raw.state.sessionID : "",
+      },
+      log: (Array.isArray(raw.log) ? raw.log : []).filter(
+        (e) => typeof e === "object" && e !== null,
+      ) as Record<string, unknown>[],
+    }
+  } catch {
+    return { state: { lastRollAt: 0, lastSpeakAt: 0, misses: 0, sessionID: "" }, log: [] }
+  }
+}
+
+async function saveSpeakFile(state: SpeakUpState, log: Record<string, unknown>[]): Promise<void> {
+  const tmp = SPEAKUP_LOG + ".tmp"
+  await writeFile(tmp, JSON.stringify({ state, log: log.slice(0, 60) }, null, 2), "utf-8")
+  await rename(tmp, SPEAKUP_LOG)
+}
+
+async function speakRecord(file: SpeakFile, entry: Record<string, unknown>): Promise<void> {
+  file.log = [{ at: bjTime(), ...entry }, ...file.log].slice(0, 60)
+  await saveSpeakFile(file.state, file.log)
+}
+
 export default Plugin.define({
   id: "bili-subagent",
   async setup(ctx) {
@@ -125,6 +237,14 @@ export default Plugin.define({
             text: buildScanPrompt(direction, opts.perScan, "手动 /bili 命令"),
             delivery: "queue",
           })
+        },
+      })
+      editor.add({
+        name: "speak",
+        description: "主动搭话（不掷骰、不受冷却、不动连败计数）：默认演练 dry-run，参数带「真发」两字才真发，如 `/speak` 或 `/speak 真发`",
+        execute: async ({ prompt }) => {
+          const force = (prompt.text || "").indexOf("真发") >= 0
+          return await manualSpeak(force)
         },
       })
     })
@@ -176,6 +296,112 @@ export default Plugin.define({
       })
     }
 
+    // ---- 主动搭话（setup 内，可用 ctx）----
+    // 距目标会话最近一次消息的分钟数；解析不出（空会话/失败）返回 null = 当作"冷很久"
+    async function lastTalkMin(sessionID: string): Promise<number | null> {
+      try {
+        const msgs = (await ctx.session.context({ sessionID })) as unknown
+        if (!Array.isArray(msgs) || msgs.length === 0) return null
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i] as Record<string, unknown>
+          const t = (typeof m.time === "object" && m.time !== null ? m.time : {}) as Record<string, unknown>
+          const raw =
+            (typeof t.created === "number" && t.created) ||
+            (typeof t.start === "number" && t.start) ||
+            (typeof m.createdAt === "number" && m.createdAt) ||
+            0
+          if (raw > 0) {
+            const ms = raw < 1e12 ? raw * 1000 : raw // 秒/毫秒都认
+            return Math.max(0, (Date.now() - ms) / 60_000)
+          }
+        }
+        return null
+      } catch {
+        return null
+      }
+    }
+
+    // 真发派发：目标会话 cfg.targetSessionID 优先，其次上次记忆；都没有就新建并复用「茶话」会话
+    async function speakDispatch(cfg: SpeakUpCfg, file: SpeakFile): Promise<string> {
+      let sessionID = cfg.targetSessionID || file.state.sessionID
+      if (!sessionID) {
+        const created = await ctx.session.create({ title: "bili-subagent 茶话" })
+        file.state.sessionID = created.id
+        sessionID = created.id
+      }
+      await ctx.session.prompt({ sessionID, text: cfg.prompt, delivery: "queue" })
+      return sessionID
+    }
+
+    // 每 60s tick 都进来一趟，先过 intervalMin 门（不掷骰不算），再过安静/冷却门，然后才真掷骰
+    async function speakUpTick(): Promise<void> {
+      const cfg = await readSpeakUpCfg()
+      if (!cfg.enabled) return
+      const file = await loadSpeakFile()
+      const now = Date.now()
+      if (file.state.lastRollAt && now - file.state.lastRollAt < cfg.intervalMin * 60_000) return
+      file.state.lastRollAt = now
+      await saveSpeakFile(file.state, file.log) // 只推进掷骰时间，不写日志行
+      const hour = new Date(now + 8 * 3600_000).getUTCHours() // 北京小时（本机时区≈北京，仍按北京算）
+      if (inQuietHours(hour, cfg)) return
+      if (cfg.cooldownMin > 0 && file.state.lastSpeakAt && now - file.state.lastSpeakAt < cfg.cooldownMin * 60_000) return
+
+      // 命中线 = min(100, base×factor + min(boostMax, misses×boost))
+      const peak = !inValleyBJ()
+      const base = peak ? cfg.peakHit : cfg.valleyHit
+      const talkID = cfg.targetSessionID || file.state.sessionID
+      const sinceTalk = talkID ? await lastTalkMin(talkID) : null
+      const factor = sinceTalk === null ? 1.5 : sinceTalk < cfg.nearMin ? 0.15 : sinceTalk > cfg.farMin ? 1.5 : 1
+      const line = Math.min(100, base * factor + Math.min(cfg.missBoostMax, file.state.misses * cfg.missBoost))
+      const roll = Math.random() * 100
+      if (roll >= line) {
+        // 没掷中：连败 +1，下次概率更高
+        file.state.misses += 1
+        await speakRecord(file, { type: "miss", roll: round1(roll), line: round1(line), peak })
+        return
+      }
+      // 掷中（连败清零）：dry-run 只记账不真发
+      file.state.misses = 0
+      if (cfg.dryRun) {
+        await speakRecord(file, { type: "dry", roll: round1(roll), line: round1(line), peak })
+        console.log("[bili-subagent] speak-up hit (dry-run), line=" + round1(line))
+        return
+      }
+      try {
+        const sid = await speakDispatch(cfg, file)
+        file.state.lastSpeakAt = Date.now()
+        await speakRecord(file, { type: "speak", roll: round1(roll), line: round1(line), peak, sessionID: sid })
+        console.log("[bili-subagent] speak-up dispatched to " + sid)
+      } catch (e) {
+        // 派发失败：会话多半被手动删了，清掉记忆下次新建
+        file.state.sessionID = ""
+        await speakRecord(file, { type: "failed", roll: round1(roll), line: round1(line), error: String(e).slice(0, 200) })
+        console.error("[bili-subagent] speak dispatch failed:", String(e))
+      }
+    }
+
+    // /speak 手动路径：不掷骰、不受冷却、不动连败计数；默认演练，参数带「真发」才真发
+    async function manualSpeak(force: boolean): Promise<string> {
+      const cfg = await readSpeakUpCfg()
+      const dry = !force && cfg.dryRun
+      const peak = !inValleyBJ()
+      const file = await loadSpeakFile()
+      if (dry) {
+        await speakRecord(file, { type: "manual-dry", peak })
+        return "✅ 主动搭话【演练】完成（dry-run，未真发）。想真发：`/speak 真发`。连败计数不动。"
+      }
+      try {
+        const sid = await speakDispatch(cfg, file)
+        file.state.lastSpeakAt = Date.now()
+        await speakRecord(file, { type: "manual-speak", peak, sessionID: sid })
+        return "✅ 已真发主动搭话 → 会话 " + sid.slice(0, 8) + "…（伙伴会在队列里自然接话）"
+      } catch (e) {
+        file.state.sessionID = ""
+        await speakRecord(file, { type: "manual-failed", error: String(e).slice(0, 200) })
+        return "⚠️ 主动搭话派发失败：" + String(e).slice(0, 160)
+      }
+    }
+
     async function tick(): Promise<void> {
       const eff: BiliOptions = { ...opts, ...(await readCfgOverrides()) }
       if (eff.autoMode === "manual") return
@@ -206,6 +432,7 @@ export default Plugin.define({
 
     const timer = setInterval(() => {
       void tick().catch((e: unknown) => console.error("[bili-subagent] tick error:", String(e)))
+      void speakUpTick().catch((e: unknown) => console.error("[bili-subagent] speak tick error:", String(e)))
     }, 60_000)
     console.log("[bili-subagent] scheduler armed (interval 60s)")
 

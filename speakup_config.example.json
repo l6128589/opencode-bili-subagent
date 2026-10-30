@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "dryRun": true,
+  "intervalMin": 30,
+  "cooldownMin": 20,
+  "missBoost": 10,
+  "missBoostMax": 40,
+  "quietStart": 1,
+  "quietEnd": 8,
+  "nearMin": 20,
+  "farMin": 360,
+  "peakHit": 20,
+  "valleyHit": 60,
+  "prompt": "好久没什么动静了……想找个话说说话",
+  "targetSessionID": ""
+}
